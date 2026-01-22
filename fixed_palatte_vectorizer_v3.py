@@ -12,14 +12,26 @@ import numpy as np
 # Added WHITE.
 # ============================================================
 DEFAULT_PALETTE = [
-    {"palette_id": 0, "name": "BLUE",   "bgr": (255,   0,   0)},
-    {"palette_id": 1, "name": "ORANGE", "bgr": (  0, 165, 255)},
-    {"palette_id": 2, "name": "GREEN",  "bgr": (  0, 255,   0)},
-    {"palette_id": 3, "name": "RED",    "bgr": (  0,   0, 255)},
-    {"palette_id": 4, "name": "BROWN",  "bgr": ( 25,  80, 140)},  # tweak to match your brown crayon
-    {"palette_id": 5, "name": "GREY",   "bgr": (128, 128, 128)},
-    {"palette_id": 6, "name": "BLACK",  "bgr": (  0,   0,   0)},
-    {"palette_id": 7, "name": "WHITE",  "bgr": (255, 255, 255)},
+    # ---- BLUES ----
+    {"palette_id": 0, "name": "BLUE", "bgr": (238, 202, 151)},  # light blue
+    {"palette_id": 1, "name": "BLUE", "bgr": (200, 180, 130)},  # optional darker blue
+
+    # ---- GREEN ----
+    {"palette_id": 2, "name": "GREEN", "bgr": (137, 137, 107)},
+
+    # ---- ORANGE ----
+    {"palette_id": 3, "name": "ORANGE", "bgr": (105, 141, 228)},
+
+    # ---- YELLOW ----
+    {"palette_id": 4, "name": "YELLOW", "bgr": (129, 246, 229)},
+
+    # ---- BROWN ----
+    {"palette_id": 5, "name": "BROWN", "bgr": (92, 99, 169)},
+
+    # ---- NEUTRALS ----
+    {"palette_id": 6, "name": "BLACK", "bgr": (77, 78, 74)},
+    {"palette_id": 7, "name": "GREY",  "bgr": (186, 186, 186)},
+    {"palette_id": 8, "name": "WHITE", "bgr": (236, 235, 228)},
 ]
 
 
@@ -108,88 +120,113 @@ def snap_centers_to_palette_semantic(
     palette_bgr,
     palette_names,
     name_to_id,
-    s_grey=40,
+    # Neutral thresholds (tune)
     v_black=35,
+    v_white=235,
     s_white=25,
-    v_white=235
+    # Low-sat handling
+    s_low=35,
+    # Brown decision thresholds
+    v_brown_max=170,
 ):
     """
-    Key upgrade:
-    - Use HSV "neutral gate" on each cluster center:
-        if V <= v_black -> BLACK
-        elif S <= s_white and V >= v_white -> WHITE
-        elif S <= s_grey -> GREY
-        else -> snap among chromatic palette colors via Lab distance
-
-    This prevents:
-    - light blue -> GREY (by lowering neutral gating for chroma-like colors)
-    - white background -> ORANGE (WHITE category exists & is gated)
+    Hue-gated semantic snapping:
+    - BLACK / WHITE first
+    - low-sat: GREY vs BROWN by V
+    - chromatic: restrict candidate palette colors by Hue bands, then snap in Lab
     """
 
-    # Precompute Lab for palette
+    # Precompute palette Lab
     palette_lab = cv2.cvtColor(
         palette_bgr.reshape((-1, 1, 3)).astype(np.uint8),
         cv2.COLOR_BGR2LAB
     ).reshape((-1, 3)).astype(np.float32)
 
-    # Identify which palette indices are chromatic candidates
-    # (exclude GREY/BLACK/WHITE from "color snapping")
-    excluded = {"GREY", "BLACK", "WHITE"}
-    chroma_idx = [i for i, n in enumerate(palette_names) if n not in excluded]
-    chroma_idx = np.array(chroma_idx, dtype=np.int32)
+    # Helper: get palette index by name
+    name_to_palette_index = {n: i for i, n in enumerate(palette_names)}
+
+    def pick_named(name):
+        i = name_to_palette_index[name]
+        return palette_bgr[i], name, name_to_id[name]
+
+    # Hue bands in OpenCV HSV (H 0..179)
+    # (these are broad on purpose)
+    def hue_band_candidates(h):
+        # Blue/cyan: ~90-140
+        if 90 <= h <= 140:
+            return ["BLUE"]
+        # Green: ~35-85
+        if 35 <= h <= 85:
+            return ["GREEN"]
+        # Orange/yellow: ~10-34
+        if 10 <= h < 35:
+            return ["ORANGE", "BROWN", "RED"]
+        # Red wraps: [0-9] or [170-179]
+        return ["RED", "ORANGE", "BROWN"]
 
     snapped = np.zeros_like(centers_bgr, dtype=np.uint8)
     palette_id_per_cluster = np.zeros((centers_bgr.shape[0],), dtype=np.int32)
     palette_name_per_cluster = [""] * centers_bgr.shape[0]
 
     for ci, c in enumerate(centers_bgr):
-        h, s, v = _bgr_to_hsv01(c)
+        hsv = cv2.cvtColor(np.array(c, np.uint8).reshape(1, 1, 3), cv2.COLOR_BGR2HSV)[0, 0]
+        h, s, v = int(hsv[0]), int(hsv[1]), int(hsv[2])
 
-        # Neutral gate
+        # ---- Neutral gates ----
         if v <= v_black:
-            pname = "BLACK"
-            pid = name_to_id[pname]
-            pbgr = next(p["bgr"] for p in DEFAULT_PALETTE if p["name"] == pname)
-            snapped[ci] = np.array(pbgr, dtype=np.uint8)
+            pbgr, pname, pid = pick_named("BLACK")
+            snapped[ci] = pbgr
             palette_id_per_cluster[ci] = pid
             palette_name_per_cluster[ci] = pname
             continue
 
-        if (s <= s_white) and (v >= v_white):
-            pname = "WHITE"
-            pid = name_to_id[pname]
-            pbgr = next(p["bgr"] for p in DEFAULT_PALETTE if p["name"] == pname)
-            snapped[ci] = np.array(pbgr, dtype=np.uint8)
+        if (v >= v_white) and (s <= s_white):
+            pbgr, pname, pid = pick_named("WHITE")
+            snapped[ci] = pbgr
             palette_id_per_cluster[ci] = pid
             palette_name_per_cluster[ci] = pname
             continue
 
-        if s <= s_grey:
-            pname = "GREY"
-            pid = name_to_id[pname]
-            pbgr = next(p["bgr"] for p in DEFAULT_PALETTE if p["name"] == pname)
-            snapped[ci] = np.array(pbgr, dtype=np.uint8)
+        # ---- Low saturation handling (this is where brown was becoming grey) ----
+        # If it's low-sat AND somewhat dark, prefer BROWN; else GREY
+        if s <= s_low:
+            if v <= v_brown_max:
+                pbgr, pname, pid = pick_named("BROWN")
+            else:
+                pbgr, pname, pid = pick_named("GREY")
+            snapped[ci] = pbgr
             palette_id_per_cluster[ci] = pid
             palette_name_per_cluster[ci] = pname
             continue
 
-        # Chromatic snap using Lab distance to chroma palette entries
-        c_lab = cv2.cvtColor(
-            np.array(c, dtype=np.uint8).reshape((1, 1, 3)),
-            cv2.COLOR_BGR2LAB
-        ).reshape((3,)).astype(np.float32)
+        # ---- Chromatic snap with hue-gated candidates ----
+        candidates = hue_band_candidates(h)
 
-        d = ((palette_lab[chroma_idx] - c_lab[None, :]) ** 2).sum(axis=1)
-        best_local = int(np.argmin(d))
-        best_palette_index = int(chroma_idx[best_local])
+        # Build candidate palette indices (ignore missing names gracefully)
+        cand_idx = []
+        for name in candidates:
+            if name in name_to_palette_index:
+                cand_idx.append(name_to_palette_index[name])
+        if not cand_idx:
+            # fallback: if something weird happens, allow all chromatic
+            cand_idx = [i for i, n in enumerate(palette_names) if n not in ("GREY", "BLACK", "WHITE")]
 
-        snapped[ci] = palette_bgr[best_palette_index]
-        pname = palette_names[best_palette_index]
+        cand_idx = np.array(cand_idx, dtype=np.int32)
+
+        c_lab = cv2.cvtColor(np.array(c, np.uint8).reshape(1, 1, 3), cv2.COLOR_BGR2LAB).reshape(3).astype(np.float32)
+        d = ((palette_lab[cand_idx] - c_lab[None, :]) ** 2).sum(axis=1)
+        best = int(cand_idx[int(np.argmin(d))])
+
+        pbgr = palette_bgr[best]
+        pname = palette_names[best]
         pid = name_to_id[pname]
+
+        snapped[ci] = pbgr
         palette_id_per_cluster[ci] = pid
         palette_name_per_cluster[ci] = pname
 
     return snapped, palette_id_per_cluster, palette_name_per_cluster
+
 
 
 # -----------------------------
@@ -424,7 +461,8 @@ def main():
     ap.add_argument("--hole-mode", choices=["evenodd", "hierarchy"], default="hierarchy")
 
     # Neutral gate thresholds (tune if needed)
-    ap.add_argument("--s-grey", type=int, default=40, help="If S <= this -> GREY (unless WHITE).")
+    ap.add_argument("--s-low", type=int, default=35, help="Low saturation cutoff; below this we choose GREY vs BROWN by value.")
+    ap.add_argument("--v-brown-max", type=int, default=170, help="If low-sat and V <= this, classify as BROWN; else GREY.")
     ap.add_argument("--v-black", type=int, default=35, help="If V <= this -> BLACK.")
     ap.add_argument("--s-white", type=int, default=25, help="If S <= this and V >= v-white -> WHITE.")
     ap.add_argument("--v-white", type=int, default=235, help="If V >= this and S <= s-white -> WHITE.")
@@ -450,15 +488,17 @@ def main():
 
     # Snap with semantic gating
     snapped_centers, palette_id_per_cluster, palette_name_per_cluster = snap_centers_to_palette_semantic(
-        centers_bgr=centers_bgr,
-        palette_bgr=palette_bgr,
-        palette_names=palette_names,
-        name_to_id=name_to_id,
-        s_grey=args.s_grey,
-        v_black=args.v_black,
-        s_white=args.s_white,
-        v_white=args.v_white,
-    )
+    centers_bgr=centers_bgr,
+    palette_bgr=palette_bgr,
+    palette_names=palette_names,
+    name_to_id=name_to_id,
+    v_black=args.v_black,
+    v_white=args.v_white,
+    s_white=args.s_white,
+    s_low=args.s_low,
+    v_brown_max=args.v_brown_max,
+)
+
     centers_bgr = snapped_centers  # downstream uses snapped colors
 
     if do_outlines:
@@ -506,13 +546,15 @@ def main():
             "min_area_px": int(args.min_area),
             "epsilon": float(args.epsilon),
             "hole_mode": str(args.hole_mode),
-            "neutral_gate": {
-                "s_grey": int(args.s_grey),
-                "v_black": int(args.v_black),
-                "s_white": int(args.s_white),
-                "v_white": int(args.v_white)
-            }
+        "neutral_gate": {
+            "s_low": int(args.s_low),
+            "v_brown_max": int(args.v_brown_max),
+            "v_black": int(args.v_black),
+            "s_white": int(args.s_white),
+            "v_white": int(args.v_white)
         }
+    }
+
 
         p = out_path_for(input_path, "vector.json")
         with open(p, "w", encoding="utf-8") as f:
