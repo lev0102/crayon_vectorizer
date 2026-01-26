@@ -23,9 +23,11 @@ import time
 LABEL_KEYS = {
     ord('r'): "RED",
     ord('o'): "ORANGE",
+    ord('y'): "YELLOW",
     ord('g'): "GREEN",
     ord('b'): "BLUE",
     ord('n'): "BROWN",
+    ord('t'): "SKIN",
     ord('e'): "GREY",
     ord('k'): "BLACK",
 }
@@ -74,18 +76,25 @@ def draw_panel():
     # right-side info panel background
     x0 = W - SWATCH_W - PADDING
     y0 = PADDING
-    cv2.rectangle(disp, (x0 - 6, y0 - 6), (x0 + SWATCH_W + 6, y0 + SWATCH_H + 120), (245, 245, 245), -1)
+    cv2.rectangle(disp, (x0 - 6, y0 - 6), (x0 + SWATCH_W + 6, y0 + SWATCH_H + 190), (245, 245, 245), -1)
 
     # current label
     cv2.putText(disp, f"Current: {current_label}", (x0, y0 + 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
 
-    # shortcut hint
-    cv2.putText(disp, "Keys: R O G B N E K", (x0, y0 + 45),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
-
-    cv2.putText(disp, "U=undo  S=save  Q=quit", (x0, y0 + 65),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+    # shortcut hint (on-screen)
+    help_lines = [
+        "R:RED  O:ORANGE  Y:YELLOW",
+        "G:GREEN  B:BLUE  N:BROWN",
+        "T:SKIN  E:GREY  K:BLACK",
+        "U=undo  S=save  Q=quit",
+        "Left click: sample current label",
+    ]
+    yy = y0 + 45
+    for line in help_lines:
+        cv2.putText(disp, line, (x0, yy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 1, cv2.LINE_AA)
+        yy += 18
 
     # sample count
     cv2.putText(disp, f"Samples: {len(samples)}", (x0, y0 + 90),
