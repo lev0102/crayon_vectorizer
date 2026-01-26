@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+# python fixed_palatte_vectorizer_v4.py --input input/Drawing0.jpg --palette-json output/output_palette_Drawing0.json --all --s-low 7 --v-black 70 --v-brown-max 130
+
 """
 fixed_palatte_vectorizer_v4_palette_json.py
 
