@@ -41,3 +41,4 @@ env/
 output/
 *.json
 *.jpg
+*.png

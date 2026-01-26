@@ -35,6 +35,48 @@ DEFAULT_PALETTE = [
     {"palette_id": 8, "name": "WHITE", "bgr": (236, 235, 228)},
 ]
 
+# ============================================================
+# Optional canonical name mapping (group multiple picked names
+# into one output category).
+# - Used ONLY for JSON export fields "palette_name" (canonical).
+# - Raw picked/snapped name is preserved as "palette_name_raw".
+#
+# Adjust to your needs:
+#   ORANGE/BROWN/SKIN -> FARMLAND (example)
+#   GREY/BLACK        -> ROAD
+#   Others unchanged
+# ============================================================
+CANONICAL_NAME_MAP = {
+    # "ORANGE": "FARMLAND",
+    # "BROWN": "FARMLAND",
+    # "SKIN": "FARMLAND",
+    # "GREY": "ROAD",
+    # "BLACK": "ROAD",
+}
+
+def load_palette_from_json(path: Path):
+    """Load palette entries from picker JSON.
+    Expected format:
+      { ..., "palette_entries": [ {"palette_id":int,"name":str,"bgr":[B,G,R]}, ... ] }
+    Returns list of dicts compatible with DEFAULT_PALETTE entries.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    entries = data.get("palette_entries", None)
+    if not isinstance(entries, list) or len(entries) == 0:
+        raise ValueError(f"Palette JSON has no 'palette_entries' list: {path}")
+
+    out = []
+    for i, e in enumerate(entries):
+        pid = int(e.get("palette_id", i))
+        name = str(e.get("name", "UNNAMED")).upper().strip()
+        bgr = e.get("bgr", None)
+        if bgr is None or len(bgr) != 3:
+            raise ValueError(f"Bad bgr at entry {i}: {e}")
+        out.append({"palette_id": pid, "name": name, "bgr": (int(bgr[0]), int(bgr[1]), int(bgr[2]))})
+    return out
+
 
 # -----------------------------
 # Utils
@@ -101,13 +143,15 @@ def quantize_kmeans_lab(bgr, k=14, attempts=3, max_iter=30):
     return labels, centers_bgr
 
 
-def build_locked_palette():
-    palette_bgr = np.array([list(p["bgr"]) for p in DEFAULT_PALETTE], dtype=np.uint8)
-    palette_names = [p["name"] for p in DEFAULT_PALETTE]
-    palette_ids = np.array([p["palette_id"] for p in DEFAULT_PALETTE], dtype=np.int32)
+def build_locked_palette(palette_entries=None):
+    palette_entries = DEFAULT_PALETTE if palette_entries is None else palette_entries
+
+    palette_bgr = np.array([list(p["bgr"]) for p in palette_entries], dtype=np.uint8)
+    palette_names = [p["name"] for p in palette_entries]
+    palette_ids = np.array([p["palette_id"] for p in palette_entries], dtype=np.int32)
 
     name_to_indices = {}
-    for i, p in enumerate(DEFAULT_PALETTE):
+    for i, p in enumerate(palette_entries):
         name_to_indices.setdefault(p["name"], []).append(i)
 
     return palette_bgr, palette_names, palette_ids, name_to_indices
@@ -162,9 +206,9 @@ def snap_centers_to_palette_semantic(
             return ["GREEN"]
         # Orange/yellow: ~10-34
         if 10 <= h < 35:
-            return ["ORANGE", "BROWN", "RED"]
+            return ["ORANGE", "BROWN", "YELLOW", "RED", "SKIN"]
         # Red wraps: [0-9] or [170-179]
-        return ["RED", "ORANGE", "BROWN"]
+        return ["RED", "ORANGE", "BROWN", "YELLOW", "SKIN"]
 
     snapped = np.zeros_like(centers_bgr, dtype=np.uint8)
     palette_id_per_cluster = np.zeros((centers_bgr.shape[0],), dtype=np.int32)
@@ -333,6 +377,7 @@ def contour_to_points_raw(c):
 
 def export_vector_json(labels, centers_bgr, palette_id_per_cluster, palette_name_per_cluster,
                        out_shape,
+                       palette_entries=None,
                        close_radius=3, open_radius=1,
                        min_area_px=300, simplify_epsilon_px=3.0,
                        include_holes=True):
@@ -360,7 +405,8 @@ def export_vector_json(labels, centers_bgr, palette_id_per_cluster, palette_name
             hierarchy = hierarchy[0]
 
         pal_id = int(palette_id_per_cluster[ci])
-        pal_name = str(palette_name_per_cluster[ci])
+        pal_name_raw = str(palette_name_per_cluster[ci])
+        pal_name = CANONICAL_NAME_MAP.get(pal_name_raw, pal_name_raw)
 
         for idx, c in enumerate(contours):
             area = float(cv2.contourArea(c))
@@ -396,6 +442,8 @@ def export_vector_json(labels, centers_bgr, palette_id_per_cluster, palette_name
                 "palette_id": pal_id,
                 "palette_name": pal_name,
 
+                "palette_name_raw": pal_name_raw,
+
                 "is_hole": bool(is_hole),
                 "is_background": bool(is_background),
 
@@ -418,7 +466,8 @@ def export_vector_json(labels, centers_bgr, palette_id_per_cluster, palette_name
         clusters.append({
             "cluster_id": int(i),
             "palette_id": int(palette_id_per_cluster[i]),
-            "palette_name": str(palette_name_per_cluster[i]),
+            "palette_name_raw": str(palette_name_per_cluster[i]),
+            "palette_name": CANONICAL_NAME_MAP.get(str(palette_name_per_cluster[i]), str(palette_name_per_cluster[i])),
             "color_bgr": bgr_to_xyz_dict(c),
             "color_bgr_raw": [int(x) for x in c],
             "color_hex": bgr_to_hex(c)
@@ -430,7 +479,7 @@ def export_vector_json(labels, centers_bgr, palette_id_per_cluster, palette_name
         "color_bgr": bgr_to_xyz_dict(p["bgr"]),
         "color_bgr_raw": [int(x) for x in p["bgr"]],
         "color_hex": bgr_to_hex(p["bgr"])
-    } for p in DEFAULT_PALETTE]
+    } for p in (DEFAULT_PALETTE if palette_entries is None else palette_entries)]
 
     return {
         "image": {"width": int(w), "height": int(h)},
@@ -448,6 +497,7 @@ def main():
         description="Non-ML: kmeans + locked semantic palette + HSV neutral gate + outlines/fill + UE-friendly JSON"
     )
     ap.add_argument("--input", required=True, help="Path to input image (jpg/png).")
+    ap.add_argument("--palette-json", default=None, help="Optional: palette JSON exported by pick_palette_points.py (lets you have MANY shades per name).")
 
     ap.add_argument("--outlines", action="store_true")
     ap.add_argument("--fill", action="store_true")
@@ -488,7 +538,11 @@ def main():
 
     labels, centers_bgr = quantize_kmeans_lab(bgr, k=args.k)
 
-    palette_bgr, palette_names, palette_ids, name_to_indices = build_locked_palette()
+    palette_entries = None
+    if args.palette_json:
+        palette_entries = load_palette_from_json(Path(args.palette_json))
+
+    palette_bgr, palette_names, palette_ids, name_to_indices = build_locked_palette(palette_entries)
 
 
     # Snap with semantic gating
@@ -541,10 +595,12 @@ def main():
             open_radius=args.open_,
             min_area_px=args.min_area,
             simplify_epsilon_px=args.epsilon,
-            include_holes=True
+            include_holes=True,
+            palette_entries=palette_entries
         )
         data["meta"] = {
             "input": str(input_path.name),
+            "palette_json": (str(Path(args.palette_json).name) if args.palette_json else None),
             "scaled": bool(scale != 1.0),
             "scale_factor": float(scale),
             "k": int(args.k),
