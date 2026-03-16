@@ -1,0 +1,352 @@
+Yep. Here’s a **Blueprint step-by-step setup** for the **central Grid/Crush Manager + per-spawner HISM** architecture. I’ll keep it implementable and modular, and you can expand later.
+
+I’ll assume:
+
+* You already have: JSON Manager/Scheduler + SpawnerBase + child spawners + batching
+* Now you want: grid height + crush + save/load foundation
+
+---
+
+# Phase 0 — Decide grid space
+
+### 0.1 Pick grid cell size
+
+Create constant/variable:
+
+* `CellSize` (float) e.g. **100.0** (1m)
+
+### 0.2 Define grid bounds
+
+You need a world-space rectangle that covers your ground.
+
+In manager:
+
+* `GridOrigin` (Vector) = world location of **min corner** (bottom-left) of the grid
+* `GridWidth` (int), `GridHeight` (int)
+* Or compute from a “GroundBounds” actor/box component
+
+**Tip:** easiest:
+
+* Place a `BP_GridBounds` actor with a `BoxComponent`
+* Use its bounds to initialize origin + size
+
+---
+
+# Phase 1 — Create the data structs
+
+## 1.1 Struct: `FInstanceRef`
+
+Create a Blueprint Struct with:
+
+* `SpawnerKey` (Name)  (e.g. "ROAD", "FARM", "CITY")
+* `InstanceIndex` (Int)
+* `LayerId` (Int)
+* `LastKnownScaleZ` (Float) (optional)
+* `LastKnownHeight` (Float) (optional)
+
+> We store `SpawnerKey` instead of a component ref so save/load stays clean.
+
+## 1.2 Struct: `FCellData`
+
+Blueprint Struct:
+
+* `TopZ` (Float)
+* `TopInstance` (FInstanceRef)
+* `bHasTop` (Bool)
+
+(We start simple: store only top. Later you can store stack arrays.)
+
+## 1.3 Struct: `FPlacementRequest`
+
+* `SpawnerKey` (Name)
+* `LayerId` (Int)
+* `XY` (Vector2D)
+* `FootprintRadius` (Float) (or HalfExtents Vector2D)
+* `BaseHeight` (Float) (your “crush unit height increment” or mesh height)
+* `CrushFactor` (Float) (optional)
+
+## 1.4 Struct: `FPlacementResult`
+
+* `bAllowed` (Bool)
+* `FinalLocation` (Vector)
+* `SupportZ` (Float)
+* `CellsTouched` (Int Array) (optional)
+* `InstancesToCrush` (FInstanceRef Array)
+
+---
+
+# Phase 2 — Build the Grid/Crush Manager actor
+
+Create `BP_GridCrushManager` (Actor)
+Place it in the level (or spawn it).
+
+## 2.1 Variables
+
+* `CellSize` (float)
+* `GridOrigin` (Vector)
+* `GridWidth` (int)
+* `GridHeight` (int)
+* `GridCells` (Array of FCellData) size = `GridWidth * GridHeight`
+
+Spawner registry:
+
+* `SpawnerMap` (Map<Name, BP_SpawnerBase Ref>)  *(or interface ref)*
+
+Crush settings:
+
+* `MinScaleZ` (float) e.g. 0.2
+* `CrushFactorPerLayer` (float) e.g. 0.7
+* `LayerStepHeight` (float) e.g. 20.0 (or use mesh bounds)
+
+---
+
+## 2.2 Function: `InitGridFromBounds(BoxComponentRef)`
+
+**Goal:** set origin/width/height and allocate GridCells.
+
+Steps:
+
+1. Get box world bounds:
+
+   * `GetComponentBounds` → Origin, BoxExtent
+2. Compute min corner:
+
+   * `Min = Origin - BoxExtent`
+   * `GridOrigin = Min` (use X,Y, and set Z baseline)
+3. Compute sizes:
+
+   * `GridWidth = Ceil((BoxExtent.X*2) / CellSize)`
+   * `GridHeight = Ceil((BoxExtent.Y*2) / CellSize)`
+4. Allocate:
+
+   * `GridCells.SetNum(GridWidth * GridHeight)`
+5. Initialize each cell:
+
+   * `TopZ = GridOrigin.Z` (or 0)
+   * `bHasTop = false`
+
+Call this once at BeginPlay.
+
+---
+
+# Phase 3 — Coordinate conversion functions (critical)
+
+## 3.1 `WorldXYToCell(XY) -> CellX, CellY`
+
+* `LocalX = XY.X - GridOrigin.X`
+* `LocalY = XY.Y - GridOrigin.Y`
+* `CellX = Floor(LocalX / CellSize)`
+* `CellY = Floor(LocalY / CellSize)`
+
+Clamp to [0..Width-1], [0..Height-1]
+
+## 3.2 `CellToIndex(CellX, CellY) -> Index`
+
+* `Index = CellX + CellY * GridWidth`
+
+## 3.3 `FootprintToCellIndices(XY, Radius) -> Indices[]`
+
+Compute:
+
+* `MinX = XY.X - Radius`
+* `MaxX = XY.X + Radius`
+* `MinY = XY.Y - Radius`
+* `MaxY = XY.Y + Radius`
+  Convert to cell coords:
+* `MinCellX..MaxCellX`, `MinCellY..MaxCellY`
+  Loop over that rectangle and add indices.
+
+> Start with radius footprint. Later you can use mesh bounds/box extents.
+
+---
+
+# Phase 4 — Placement API (the core)
+
+## 4.1 Function: `RequestPlaceInstance(Request : FPlacementRequest) -> Result : FPlacementResult`
+
+### Step A: Get touched cells
+
+* `TouchedIndices = FootprintToCellIndices(Request.XY, Request.FootprintRadius)`
+
+### Step B: Find support height
+
+* `SupportZ = max(GridCells[idx].TopZ for idx in TouchedIndices)`
+
+### Step C: Collect crush targets
+
+You said: “crush all meshes below that are overlapped”.
+
+For each touched cell:
+
+* if `GridCells[idx].bHasTop == true`:
+
+  * `TopRef = GridCells[idx].TopInstance`
+  * if `TopRef.LayerId < Request.LayerId`: add to `InstancesToCrush` (use AddUnique to avoid duplicates)
+
+### Step D: Decide final spawn Z
+
+Pick one rule now (simple + consistent):
+
+* `SpawnZ = SupportZ + LayerStepHeight`
+
+Then:
+
+* `FinalLocation = (Request.XY.X, Request.XY.Y, SpawnZ)`
+
+### Step E: Update grid *as if the new instance is placed*
+
+We need new top height after placement. For now:
+
+* `NewTopZ = SpawnZ + Request.BaseHeight`
+  (or use mesh bounds height)
+
+For each touched cell:
+
+* `GridCells[idx].TopZ = NewTopZ`
+* `GridCells[idx].TopInstance = {SpawnerKey=Request.SpawnerKey, InstanceIndex=??? , LayerId=Request.LayerId}`
+* `bHasTop=true`
+
+⚠ Important: you don’t know `InstanceIndex` until the spawner actually adds the instance.
+So do it in 2 steps:
+
+**Two-phase update**:
+
+1. RequestPlace returns support + crush list + touched cells
+2. After spawner adds instance and gets InstanceIndex, it calls:
+
+   * `CommitPlacedInstance(SpawnerKey, LayerId, InstanceIndex, TouchedIndices, NewTopZ)`
+
+This is the cleanest.
+
+So in RequestPlace:
+
+* do NOT write TopInstance yet (only compute)
+* just return `TouchedIndices`, `SupportZ`, `FinalLocation`, `InstancesToCrush`, and `NewTopZ`.
+
+---
+
+## 4.2 Function: `CommitPlacedInstance(...)`
+
+Inputs:
+
+* `SpawnerKey`, `LayerId`, `InstanceIndex`, `TouchedIndices[]`, `NewTopZ`
+
+Loop:
+
+* `GridCells[idx].TopZ = NewTopZ`
+* `GridCells[idx].bHasTop = true`
+* `GridCells[idx].TopInstance = (SpawnerKey, InstanceIndex, LayerId)`
+
+---
+
+# Phase 5 — Spawner changes (small but important)
+
+In each spawner child (or base), when you accept a point:
+
+## 5.1 Build a PlacementRequest and ask manager
+
+* call `GridManager.RequestPlaceInstance(Request)`
+
+If allowed:
+
+* Add instance to your HISM:
+
+  * `InstanceIndex = HISM.AddInstance(Transform with Result.FinalLocation)`
+* Then call:
+
+  * `GridManager.CommitPlacedInstance(SpawnerKey, LayerId, InstanceIndex, Result.CellsTouched, Result.NewTopZ)`
+
+## 5.2 Apply crush updates
+
+For each `InstanceRef` in `Result.InstancesToCrush`:
+
+* call manager function `ApplyCrush(InstanceRef)` OR call spawner directly
+
+### Recommended:
+
+Manager calls spawner through a registry:
+
+* `Spawner = SpawnerMap[InstanceRef.SpawnerKey]`
+* `Spawner.ApplyCrush(InstanceRef.InstanceIndex, CrushFactorPerLayer, MinScaleZ)`
+
+Spawner implements:
+
+* `ApplyCrush(InstanceIndex, CrushFactor, MinScaleZ)`:
+
+  * `GetInstanceTransform`
+  * scale.Z *= CrushFactor
+  * clamp
+  * `UpdateInstanceTransform`
+
+Do crush updates in batches if many.
+
+---
+
+# Phase 6 — Save/load foundation (Blueprint SaveGame)
+
+## SaveGame struct
+
+Store per layer:
+
+* array of placed instances:
+
+  * `SpawnerKey`
+  * `LayerId`
+  * `Transform`
+  * `ScaleZ` (or full scale)
+    Optionally store:
+* grid settings (CellSize, Origin, Width/Height)
+* (TopZ array) if you want fast load
+
+## Load
+
+1. Clear all spawner HISMs
+2. Re-init grid
+3. Replay instances in LayerId order:
+
+   * AddInstance in correct spawner
+   * Rebuild grid with `CommitPlacedInstance`
+   * (skip crushing because transforms already include crushed scale)
+
+---
+
+# Minimal “first working demo” steps
+
+To keep it manageable:
+
+✅ Start with:
+
+* only `TopZ` + `TopInstance` per cell (no full stack)
+* radius footprint
+* crush only “top under” (already enough visually)
+* save only instance transforms
+
+Then extend to “crush all below” more fully by storing per-cell stacks later.
+
+---
+
+## One important note about “crush all below”
+
+With the current simple cell model (only top stored), you can only crush the **topmost under** per cell.
+
+To truly crush *all below* across 3+ layers, you’ll eventually want:
+
+* `CellStacks : Array<Array<FInstanceRef>>` (stack list per cell)
+
+But don’t start there. First get:
+
+* placement Z correct
+* top crush correct
+* save/load correct
+
+Then we upgrade to stacks.
+
+---
+
+If you want, I can tailor the exact blueprint nodes for:
+
+* `FootprintToCellIndices` (with clamping)
+* `RequestPlaceInstance` / `CommitPlacedInstance`
+* `ApplyCrush` using HISM UpdateInstanceTransform
+
+Just tell me: **are you representing footprint as “radius” for now, or do you already have mesh bounds you want to use?**
