@@ -1,18 +1,24 @@
 {
   "version": 1,
-  "palette": {
-    "RED": [74, 68, 217],
+  
+  "background_names": ["BACKGROUND", "PAPER", "WHITE"],
+  "locked_palette": {
+    "RED":    [74, 68, 217],
     "ORANGE": [47, 110, 255],
     "YELLOW": [65, 190, 241],
-    "GREEN": [119, 181, 64],
-    "BLUE": [212, 108, 58],
-    "BROWN": [77, 107, 204],
-    "BLACK": [82, 86, 88]
+    "GREEN":  [119, 181, 64],
+    "BLUE":   [212, 108, 58],
+    "BROWN":  [77, 107, 204],
+    "BLACK":  [82, 86, 88],
+    "WHITE":  [255, 255, 255]
   },
-  "background_names": ["BACKGROUND", "PAPER", "WHITE"],
+  "palette_matching": {
+    "mode": "nearest_with_tolerance",
+    "tolerance": 18.0,
+    "ignore_palette_names": ["WHITE", "BLACK"],
+    "unknown_behavior": "ignore"
+  },
   "vectorizer": {
-    "max_dim": 1600,
-    "color_tolerance": 6,
     "close_radius": 3,
     "open_radius": 1,
     "min_area_px": 300,
@@ -20,10 +26,15 @@
     "include_holes": true,
     "write_fill_png": true,
     "write_outlines_png": true,
-    "write_vector_json": true,
-    "auto_run_spawn_generation": true,
-    "spawn_script": "generate_spawn_points_from_vector_json_v2.py"
+    "write_vector_json": true
   },
+
+  "automation": {
+    "auto_run_spawn_generator": true,
+    "spawn_generator_script": "generate_spawn_points_from_vector_json_v2.py",
+    "spawn_generator_extra_args": []
+  },
+  
   "spawn_generation": {
     "default_method": "scatter",
     "method_by_color": {
@@ -60,5 +71,7 @@
     "skip_hole_regions": true,
     "base_seed": 1337,
     "include_region_summaries": true
+    
+   
   }
 }
