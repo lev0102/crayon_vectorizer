@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "palette": {
+    "RED": [74, 68, 217],
+    "ORANGE": [47, 110, 255],
+    "YELLOW": [65, 190, 241],
+    "GREEN": [119, 181, 64],
+    "BLUE": [212, 108, 58],
+    "BROWN": [77, 107, 204],
+    "BLACK": [82, 86, 88]
+  },
+  "background_names": ["BACKGROUND", "PAPER", "WHITE"],
+  "vectorizer": {
+    "max_dim": 1600,
+    "color_tolerance": 6,
+    "close_radius": 3,
+    "open_radius": 1,
+    "min_area_px": 300,
+    "epsilon_px": 3.5,
+    "include_holes": true,
+    "write_fill_png": true,
+    "write_outlines_png": true,
+    "write_vector_json": true,
+    "auto_run_spawn_generation": true,
+    "spawn_script": "generate_spawn_points_from_vector_json_v2.py"
+  },
+  "spawn_generation": {
+    "default_method": "scatter",
+    "method_by_color": {
+      "RED": "scatter",
+      "ORANGE": "scatter",
+      "YELLOW": "scatter",
+      "GREEN": "scatter",
+      "BLUE": "grid",
+      "BROWN": "grid",
+      "BLACK": "spline"
+    },
+    "method_defaults": {
+      "scatter": {
+        "density_scale": 1.0,
+        "target_spacing_px": 22.0,
+        "min_distance_px": 12.0,
+        "max_points": 5000,
+        "max_attempt_factor": 20
+      },
+      "grid": {
+        "density_scale": 1.0,
+        "grid_spacing_px": 24.0,
+        "jitter_ratio": 0.35,
+        "max_points": 5000
+      },
+      "spline": {
+        "density_scale": 1.0,
+        "step_px": 16.0,
+        "closed_loop": true,
+        "max_points": 5000
+      }
+    },
+    "color_settings": {},
+    "skip_hole_regions": true,
+    "base_seed": 1337,
+    "include_region_summaries": true
+  }
+}
