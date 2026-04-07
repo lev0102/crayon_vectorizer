@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#python generate_spawn_points_from_vector_json.py --input "output/output_Drawing1_vector.json"
 """
 Second-stage generator for Unreal scatter spawning.
 
