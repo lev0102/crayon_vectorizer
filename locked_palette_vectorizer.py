@@ -187,10 +187,9 @@ def classify_pixels_to_locked_palette(
         palette_index_map: HxW int32, -1 for ignored pixels
     """
     h, w = bgr.shape[:2]
-    pixels = bgr.reshape((-1, 3)).astype(np.int16)
-    pal = palette_bgr.astype(np.int16)
+    pixels = bgr.reshape((-1, 3)).astype(np.float32)
+    pal = palette_bgr.astype(np.float32)
 
-    # squared euclidean distance in BGR
     diff = pixels[:, None, :] - pal[None, :, :]
     dist2 = np.sum(diff * diff, axis=2)
     nearest_idx = np.argmin(dist2, axis=1)

@@ -10,12 +10,13 @@
     "BLUE":   [212, 108, 58],
     "BROWN":  [77, 107, 204],
     "BLACK":  [82, 86, 88],
-    "WHITE":  [255, 255, 255]
+    "WHITE":  [255, 255, 255],
+    "BACKGROUDBLACK": [0, 0, 0]
   },
   "palette_matching": {
     "mode": "nearest_with_tolerance",
     "tolerance": 18.0,
-    "ignore_palette_names": ["WHITE", "BLACK"],
+    "ignore_palette_names": ["WHITE", "BACKGROUNDBLACK"],
     "unknown_behavior": "ignore"
   },
   "vectorizer": {
