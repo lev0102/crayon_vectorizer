@@ -35,11 +35,8 @@ This repository is a Python project. The usual file used for project setup and i
      python run_locked_palette_pipeline.py --input input/<your_input_file> --config locked_palette_pipeline_config.json --outdir output
 
 
-     python run_locked_palette_pipeline.py --input YOUR_IMAGE.png --config locked_palette_pipeline_config_dropin.json
 
-     python locked_palette_vectorizer_dropin.py --input YOUR_IMAGE.png --config locked_palette_pipeline_config_dropin.json
-
-     python run_locked_palette_pipeline.py --input input/D1.jpg --config locked_palette_pipeline_config_dropin.json --outdir output/
+     python run_locked_palette_pipeline.py --input input/D1.jpg --config locked_palette_pipeline_config.json --outdir output/
 
 8. Notes
    - `.gitignore` already ignores general generated assets like `output/` and `*.json`, but `locked_palette_pipeline_config.json` is explicitly tracked so it can be version controlled.

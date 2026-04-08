@@ -1,22 +1,64 @@
 {
   "version": 1,
-  
-  "background_names": ["BACKGROUND", "PAPER", "WHITE"],
+  "background_names": [
+    "BACKGROUND",
+    "PAPER",
+    "WHITE"
+  ],
   "locked_palette": {
-    "RED":    [74, 68, 217],
-    "ORANGE": [47, 110, 255],
-    "YELLOW": [65, 190, 241],
-    "GREEN":  [119, 181, 64],
-    "BLUE":   [212, 108, 58],
-    "BROWN":  [77, 107, 204],
-    "BLACK":  [82, 86, 88],
-    "WHITE":  [255, 255, 255],
-    "BACKGROUDBLACK": [0, 0, 0]
+    "RED": [
+      74,
+      68,
+      217
+    ],
+    "ORANGE": [
+      47,
+      110,
+      255
+    ],
+    "YELLOW": [
+      65,
+      190,
+      241
+    ],
+    "GREEN": [
+      119,
+      181,
+      64
+    ],
+    "BLUE": [
+      212,
+      108,
+      58
+    ],
+    "BROWN": [
+      77,
+      107,
+      204
+    ],
+    "BLACK": [
+      82,
+      86,
+      88
+    ],
+    "WHITE": [
+      255,
+      255,
+      255
+    ],
+    "BACKGROUDBLACK": [
+      0,
+      0,
+      0
+    ]
   },
   "palette_matching": {
     "mode": "nearest_with_tolerance",
     "tolerance": 18.0,
-    "ignore_palette_names": ["WHITE", "BACKGROUNDBLACK"],
+    "ignore_palette_names": [
+      "WHITE",
+      "BACKGROUNDBLACK"
+    ],
     "unknown_behavior": "ignore"
   },
   "vectorizer": {
@@ -29,13 +71,11 @@
     "write_outlines_png": true,
     "write_vector_json": true
   },
-
   "automation": {
     "auto_run_spawn_generator": true,
     "spawn_generator_script": "generate_spawn_points_from_vector_json_v2.py",
     "spawn_generator_extra_args": []
   },
-  
   "spawn_generation": {
     "default_method": "scatter",
     "method_by_color": {
@@ -71,8 +111,12 @@
     "color_settings": {},
     "skip_hole_regions": true,
     "base_seed": 1337,
-    "include_region_summaries": true
-    
-   
+    "include_region_summaries": true,
+    "write_spawn_json": true,
+    "write_preview_png": true,
+    "preview_point_radius": 2,
+    "preview_point_thickness": -1,
+    "preview_background": "white",
+    "preview_alpha": 1.0
   }
 }

@@ -120,14 +120,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "write_outlines_png": True,
         "write_vector_json": True,
     },
-    "spawn_generation": {
-        "write_spawn_json": True,
-        "write_preview_png": False,
-        "preview_point_radius": 2,
-        "preview_point_thickness": -1,
-        "preview_background": "white",
-        "preview_alpha": 1.0
-    },
     "automation": {
         "auto_run_spawn_generator": False,
         "spawn_generator_script": "generate_spawn_points_from_vector_json.py",

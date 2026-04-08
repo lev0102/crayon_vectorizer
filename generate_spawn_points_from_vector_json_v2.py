@@ -346,6 +346,74 @@ def generate_spawn_data(data: Dict, cfg: Dict):
     }
 
 
+
+def get_spawn_output_cfg(cfg: dict) -> dict:
+    spawn_cfg = get_spawn_cfg(cfg)
+    return {
+        "write_spawn_json": bool(spawn_cfg.get("write_spawn_json", True)),
+        "write_preview_png": bool(spawn_cfg.get("write_preview_png", False)),
+        "preview_point_radius": int(spawn_cfg.get("preview_point_radius", 2)),
+        "preview_point_thickness": int(spawn_cfg.get("preview_point_thickness", -1)),
+        "preview_background": str(spawn_cfg.get("preview_background", "white")).lower(),
+        "preview_alpha": float(spawn_cfg.get("preview_alpha", 1.0)),
+    }
+
+
+def get_palette_color_lookup(data: Dict) -> Dict[str, Tuple[int, int, int]]:
+    lookup: Dict[str, Tuple[int, int, int]] = {}
+    for entry in data.get("palette_entries", []):
+        raw = entry.get("bgr_raw")
+        name = normalize_color_name(entry.get("name", ""))
+        if raw is not None and len(raw) == 3 and name:
+            lookup[name] = (int(raw[0]), int(raw[1]), int(raw[2]))
+    for region in data.get("regions", []):
+        raw = region.get("color_bgr_raw")
+        name = normalize_color_name(region.get("palette_name", ""))
+        if raw is not None and len(raw) == 3 and name and name not in lookup:
+            lookup[name] = (int(raw[0]), int(raw[1]), int(raw[2]))
+    return lookup
+
+
+def build_spawn_preview_image(spawn_data: Dict, vector_data: Dict, cfg: Dict) -> np.ndarray:
+    image_info = vector_data.get("image", {})
+    width = int(image_info.get("width", 0))
+    height = int(image_info.get("height", 0))
+    if width <= 0 or height <= 0:
+        raise ValueError("Vector JSON image size is missing or invalid.")
+
+    out_cfg = get_spawn_output_cfg(cfg)
+    background = out_cfg["preview_background"]
+    alpha = max(0.0, min(1.0, out_cfg["preview_alpha"]))
+
+    if background == "transparent":
+        canvas = np.zeros((height, width, 4), dtype=np.uint8)
+    else:
+        base = 255 if background == "white" else 0
+        canvas = np.full((height, width, 3), base, dtype=np.uint8)
+
+    color_lookup = get_palette_color_lookup(vector_data)
+    radius = max(1, int(out_cfg["preview_point_radius"]))
+    thickness = int(out_cfg["preview_point_thickness"])
+
+    for pt in spawn_data.get("spawn_points", []):
+        name = normalize_color_name(pt.get("palette_name", ""))
+        color = color_lookup.get(name, (0, 0, 255))
+        x = int(round(float(pt.get("x", 0))))
+        y = int(round(float(pt.get("y", 0))))
+        if canvas.shape[2] == 4:
+            draw_color = (int(color[0]), int(color[1]), int(color[2]), int(round(255 * alpha)))
+        else:
+            if alpha < 1.0:
+                overlay = canvas.copy()
+                cv2.circle(overlay, (x, y), radius, color, thickness)
+                cv2.addWeighted(overlay, alpha, canvas, 1.0 - alpha, 0, canvas)
+                continue
+            draw_color = color
+        cv2.circle(canvas, (x, y), radius, draw_color, thickness)
+
+    return canvas
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Generate Unreal-friendly spawn points from vector JSON.")
     ap.add_argument("--input", required=True, help="Path to output_*_vector.json from the vectorizer.")
@@ -361,12 +429,22 @@ def main() -> None:
     data = load_json(input_path)
     cfg = load_json(config_path)
     out = generate_spawn_data(data, cfg)
+    out_cfg = get_spawn_output_cfg(cfg)
 
-    out_path = out_path_for(input_path, args.suffix, out_dir)
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=2)
+    if out_cfg["write_spawn_json"]:
+        out_path = out_path_for(input_path, args.suffix, out_dir)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=2)
+        print(f"Wrote: {out_path}")
+    else:
+        print("Skipped writing spawn JSON because spawn_generation.write_spawn_json is false.")
 
-    print(f"Wrote: {out_path}")
+    if out_cfg["write_preview_png"]:
+        preview = build_spawn_preview_image(out, data, cfg)
+        preview_path = out_path_for(input_path, "spawn_preview.png", out_dir)
+        cv2.imwrite(str(preview_path), preview)
+        print(f"Wrote: {preview_path}")
+
     print(f"Total spawn points: {len(out['spawn_points'])}")
 
 
