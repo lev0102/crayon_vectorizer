@@ -43,3 +43,4 @@ output/
 !locked_palette_pipeline_config.json
 *.jpg
 *.png
+*.psd
