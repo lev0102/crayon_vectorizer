@@ -44,3 +44,4 @@ output/
 *.jpg
 *.png
 *.psd
+!watcher_config.json
