@@ -1,0 +1,53 @@
+{
+  "websocket": {
+    "url": "ws://127.0.0.1:8080",
+    "connect_on_start": true,
+    "reconnect_on_send_failure": true
+  },
+  "watcher": {
+    "recursive": false,
+    "poll_interval_seconds": 1.0,
+    "stable_check_interval_seconds": 0.2,
+    "stable_checks_required": 3,
+    "default_debounce_seconds": 0.5,
+    "log_level": "INFO"
+  },
+  "stage1_source_jpg_watch": {
+    "enabled": true,
+    "folder": "C:\\Users\\User\\WorkAssets\\DVCY02\\TestFolerOrignalImage",
+    "file_regex": "^image\\d+\\.jpg$",
+    "case_sensitive": false,
+    "event_type": "source_jpg_ready",
+    "queue": {
+      "enabled": false,
+      "cooldown_seconds": 0.0,
+      "deduplicate_by_full_path": true
+    }
+  },
+  "stage2_processed_jpg_watch": {
+    "enabled": true,
+    "folder": "C:\\Users\\User\\WorkAssets\\DVCY02\\TestFolderModifiedImage",
+    "file_regex": "^image\\d+\\.jpg$",
+    "case_sensitive": false,
+    "run_pipeline": {
+      "enabled": true,
+      "python_executable": "",
+      "script_path": "run_locked_palette_pipeline.py",
+      "config_path": "locked_palette_pipeline_config.json",
+      "outdir": "C:\\Pipeline\\Output",
+      "extra_args": []
+    }
+  },
+  "stage3_spawn_json_watch": {
+    "enabled": true,
+    "folder": "C:\\Users\\User\\Documents\\program\\crayon_vectorizer\\output",
+    "file_regex": "^output_output_.*_vector_spawn_points\\.json$",
+    "case_sensitive": false,
+    "event_type": "spawn_json_ready",
+    "queue": {
+      "enabled": true,
+      "cooldown_seconds": 30.0,
+      "deduplicate_by_full_path": true
+    }
+  }
+}
