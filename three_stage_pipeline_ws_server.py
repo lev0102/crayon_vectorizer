@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import re
@@ -17,19 +18,28 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 try:
-    from websocket import create_connection
+    import websockets
+    from websockets.server import WebSocketServerProtocol
 except ImportError as exc:
     raise SystemExit(
-        "Missing dependency: websocket-client\n"
-        "Install with: pip install websocket-client watchdog"
+        "Missing dependency: websockets\n"
+        "Install with: pip install websockets watchdog"
     ) from exc
 
 
 DEFAULT_CONFIG = {
-    "websocket": {
-        "url": "ws://127.0.0.1:8080",
-        "connect_on_start": True,
-        "reconnect_on_send_failure": True
+    "websocket_server": {
+        "host": "127.0.0.1",
+        "port": 8080,
+        "log_client_messages": False
+    },
+    "message_format": {
+        "wrap_in_payload": True,
+        "envelope_type": "pipeline_event"
+    },
+    "pipeline_cooldown": {
+        "enabled": True,
+        "cooldown_seconds": 30.0
     },
     "watcher": {
         "recursive": False,
@@ -45,6 +55,7 @@ DEFAULT_CONFIG = {
         "file_regex": r"^image\d+\.jpg$",
         "case_sensitive": False,
         "event_type": "source_jpg_ready",
+        "allowed_events": ["created", "moved"],
         "queue": {
             "enabled": False,
             "cooldown_seconds": 0.0,
@@ -56,6 +67,7 @@ DEFAULT_CONFIG = {
         "folder": r"C:\\Pipeline\\InputB",
         "file_regex": r"^image\d+\.jpg$",
         "case_sensitive": False,
+        "allowed_events": ["created", "moved"],
         "run_pipeline": {
             "enabled": True,
             "python_executable": "",
@@ -71,9 +83,10 @@ DEFAULT_CONFIG = {
         "file_regex": r"^output_output_.*_vector_spawn_points\.json$",
         "case_sensitive": False,
         "event_type": "spawn_json_ready",
+        "allowed_events": ["created", "moved"],
         "queue": {
-            "enabled": True,
-            "cooldown_seconds": 30.0,
+            "enabled": False,
+            "cooldown_seconds": 0.0,
             "deduplicate_by_full_path": True
         }
     }
@@ -100,50 +113,6 @@ def load_config(path: Path) -> dict:
     if path.exists():
         cfg = deep_merge(cfg, load_json(path))
     return cfg
-
-
-class WebSocketSender:
-    def __init__(self, url: str, reconnect_on_send_failure: bool = True):
-        self.url = url
-        self.reconnect_on_send_failure = reconnect_on_send_failure
-        self.ws = None
-        self.lock = threading.Lock()
-
-    def connect(self) -> None:
-        with self.lock:
-            if self.ws is None:
-                self.ws = create_connection(self.url)
-                logging.info("Connected to WebSocket: %s", self.url)
-
-    def close(self) -> None:
-        with self.lock:
-            if self.ws is not None:
-                try:
-                    self.ws.close()
-                except Exception:
-                    pass
-                self.ws = None
-
-    def send_json(self, payload: dict) -> None:
-        message = json.dumps(payload, ensure_ascii=False)
-        try:
-            with self.lock:
-                if self.ws is None:
-                    self.ws = create_connection(self.url)
-                    logging.info("Connected to WebSocket: %s", self.url)
-                self.ws.send(message)
-            logging.info("Sent -> %s", message)
-        except Exception as e:
-            logging.error("WebSocket send failed: %s", e)
-            if self.reconnect_on_send_failure:
-                with self.lock:
-                    try:
-                        if self.ws is not None:
-                            self.ws.close()
-                    except Exception:
-                        pass
-                    self.ws = None
-                raise
 
 
 def normalize_name(name: str, case_sensitive: bool) -> str:
@@ -208,6 +177,14 @@ def wait_until_file_stable(path: Path, check_interval_seconds: float, stable_che
         time.sleep(check_interval_seconds)
 
 
+def extract_pipeline_key(path: Path) -> str:
+    name = path.stem
+    m = re.search(r"(image\d+)", name, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).lower()
+    return name.lower()
+
+
 @dataclass
 class QueueSettings:
     enabled: bool = False
@@ -223,8 +200,104 @@ class WatchTarget:
     debounce_seconds: float
     stable_check_interval_seconds: float
     stable_checks_required: int
+    allowed_events: set[str]
     event_type: str | None = None
     queue: QueueSettings = field(default_factory=QueueSettings)
+
+
+class PipelineCooldownManager:
+    """
+    Cooldown only for full pipeline completion messages.
+    Intended to gate Stage 3 sends, not Stage 1 or Stage 2.
+    Keyed by image id if it can be extracted, otherwise by file stem.
+    """
+    def __init__(self, enabled: bool, cooldown_seconds: float):
+        self.enabled = enabled
+        self.cooldown_seconds = cooldown_seconds
+        self.lock = threading.Lock()
+        self.last_sent_by_key: dict[str, float] = {}
+
+    def allow(self, pipeline_key: str) -> bool:
+        if not self.enabled or self.cooldown_seconds <= 0.0:
+            return True
+
+        now = time.time()
+        with self.lock:
+            last = self.last_sent_by_key.get(pipeline_key, 0.0)
+            if now - last < self.cooldown_seconds:
+                return False
+            self.last_sent_by_key[pipeline_key] = now
+            return True
+
+
+class WebSocketHub:
+    def __init__(self, loop: asyncio.AbstractEventLoop, log_client_messages: bool = False):
+        self.loop = loop
+        self.log_client_messages = log_client_messages
+        self.clients: set[WebSocketServerProtocol] = set()
+        self.clients_lock = threading.Lock()
+
+    async def register(self, ws: WebSocketServerProtocol) -> None:
+        with self.clients_lock:
+            self.clients.add(ws)
+        logging.info("WebSocket client connected. clients=%d", len(self.clients))
+
+    async def unregister(self, ws: WebSocketServerProtocol) -> None:
+        with self.clients_lock:
+            self.clients.discard(ws)
+        logging.info("WebSocket client disconnected. clients=%d", len(self.clients))
+
+    async def handler(self, websocket: WebSocketServerProtocol) -> None:
+        await self.register(websocket)
+        try:
+            async for message in websocket:
+                if self.log_client_messages:
+                    logging.info("Client -> %s", message)
+        except Exception as e:
+            logging.warning("WebSocket client handler ended: %s", e)
+        finally:
+            await self.unregister(websocket)
+
+    async def _broadcast(self, payload: dict) -> None:
+        message = json.dumps(payload, ensure_ascii=False)
+        with self.clients_lock:
+            clients = list(self.clients)
+
+        if not clients:
+            logging.warning("No connected WebSocket clients. Dropping payload: %s", message)
+            return
+
+        dead = []
+        for client in clients:
+            try:
+                await client.send(message)
+            except Exception as e:
+                logging.warning("Failed to send to client: %s", e)
+                dead.append(client)
+
+        if dead:
+            with self.clients_lock:
+                for client in dead:
+                    self.clients.discard(client)
+
+        logging.info("Broadcast -> %s", message)
+
+    def send_json_threadsafe(self, payload: dict) -> None:
+        asyncio.run_coroutine_threadsafe(self._broadcast(payload), self.loop)
+
+
+class MessageFormatter:
+    def __init__(self, cfg: dict):
+        self.wrap_in_payload = bool(cfg.get("message_format", {}).get("wrap_in_payload", True))
+        self.envelope_type = str(cfg.get("message_format", {}).get("envelope_type", "pipeline_event"))
+
+    def format(self, payload: dict) -> dict:
+        if not self.wrap_in_payload:
+            return payload
+        return {
+            "type": self.envelope_type,
+            "payload": payload
+        }
 
 
 class DelayedQueueDispatcher:
@@ -365,10 +438,20 @@ class PipelineRunner:
 
 
 class WsForwardingHandler(FileSystemEventHandler):
-    def __init__(self, target: WatchTarget, dispatcher: DelayedQueueDispatcher):
+    def __init__(
+        self,
+        target: WatchTarget,
+        dispatcher: DelayedQueueDispatcher,
+        formatter: MessageFormatter,
+        pipeline_cooldown: PipelineCooldownManager | None = None,
+        apply_pipeline_cooldown: bool = False,
+    ):
         super().__init__()
         self.target = target
         self.dispatcher = dispatcher
+        self.formatter = formatter
+        self.pipeline_cooldown = pipeline_cooldown
+        self.apply_pipeline_cooldown = apply_pipeline_cooldown
         self.last_seen_time_by_path = {}
         self.lock = threading.Lock()
 
@@ -382,6 +465,8 @@ class WsForwardingHandler(FileSystemEventHandler):
         return False
 
     def _maybe_emit(self, file_path: Path, event_name: str) -> None:
+        if event_name not in self.target.allowed_events:
+            return
         if not file_path.exists() or not file_path.is_file():
             return
         if not self.target.matcher(file_path):
@@ -401,15 +486,27 @@ class WsForwardingHandler(FileSystemEventHandler):
             logging.warning("[%s] File disappeared before stabilizing: %s", self.target.name, path_str)
             return
 
+        pipeline_key = extract_pipeline_key(file_path)
+        if self.apply_pipeline_cooldown and self.pipeline_cooldown is not None:
+            if not self.pipeline_cooldown.allow(pipeline_key):
+                logging.info(
+                    "[%s] Suppressed by pipeline cooldown for key=%s path=%s",
+                    self.target.name,
+                    pipeline_key,
+                    path_str,
+                )
+                return
+
         payload = {
-            "type": self.target.event_type,
+            "stage_type": self.target.event_type,
             "full_path": path_str,
             "file_name": file_path.name,
             "event": event_name,
             "timestamp": time.time(),
             "queue_name": self.target.name,
+            "pipeline_key": pipeline_key,
         }
-        self.dispatcher.enqueue_or_send(payload)
+        self.dispatcher.enqueue_or_send(self.formatter.format(payload))
 
     def on_created(self, event: FileSystemEvent) -> None:
         if not event.is_directory:
@@ -431,6 +528,8 @@ class PipelineTriggerHandler(FileSystemEventHandler):
         self.pipeline_runner = pipeline_runner
 
     def _maybe_run(self, file_path: Path, event_name: str) -> None:
+        if event_name not in self.target.allowed_events:
+            return
         if not file_path.exists() or not file_path.is_file():
             return
         if not self.target.matcher(file_path):
@@ -459,6 +558,10 @@ def build_queue_settings(node: dict) -> QueueSettings:
     )
 
 
+def build_allowed_events(node: dict) -> set[str]:
+    return {str(x).strip().lower() for x in node.get("allowed_events", ["created", "modified", "moved"]) if str(x).strip()}
+
+
 def build_stage1_target(cfg: dict):
     watcher_cfg = cfg["watcher"]
     node = cfg.get("stage1_source_jpg_watch", {})
@@ -471,6 +574,7 @@ def build_stage1_target(cfg: dict):
         debounce_seconds=float(watcher_cfg.get("default_debounce_seconds", 0.5)),
         stable_check_interval_seconds=float(watcher_cfg.get("stable_check_interval_seconds", 0.2)),
         stable_checks_required=int(watcher_cfg.get("stable_checks_required", 3)),
+        allowed_events=build_allowed_events(node),
         event_type=str(node.get("event_type", "source_jpg_ready")),
         queue=build_queue_settings(node),
     )
@@ -488,6 +592,7 @@ def build_stage2_target(cfg: dict):
         debounce_seconds=float(watcher_cfg.get("default_debounce_seconds", 0.5)),
         stable_check_interval_seconds=float(watcher_cfg.get("stable_check_interval_seconds", 0.2)),
         stable_checks_required=int(watcher_cfg.get("stable_checks_required", 3)),
+        allowed_events=build_allowed_events(node),
     )
 
 
@@ -503,14 +608,15 @@ def build_stage3_target(cfg: dict):
         debounce_seconds=float(watcher_cfg.get("default_debounce_seconds", 0.5)),
         stable_check_interval_seconds=float(watcher_cfg.get("stable_check_interval_seconds", 0.2)),
         stable_checks_required=int(watcher_cfg.get("stable_checks_required", 3)),
+        allowed_events=build_allowed_events(node),
         event_type=str(node.get("event_type", "spawn_json_ready")),
         queue=build_queue_settings(node),
     )
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description="3-stage file watcher for Unreal + Python pipeline.")
-    ap.add_argument("--config", default="three_stage_watcher_config.json", help="Path to config JSON.")
+async def main_async() -> None:
+    ap = argparse.ArgumentParser(description="3-stage watcher with Python-hosted WebSocket server.")
+    ap.add_argument("--config", default="three_stage_ws_server_v2_config.json", help="Path to config JSON.")
     args = ap.parse_args()
 
     config_path = Path(args.config).resolve()
@@ -522,17 +628,25 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(message)s"
     )
 
-    ws_cfg = cfg["websocket"]
-    sender = WebSocketSender(
-        url=str(ws_cfg["url"]),
-        reconnect_on_send_failure=bool(ws_cfg.get("reconnect_on_send_failure", True)),
+    loop = asyncio.get_running_loop()
+    ws_cfg = cfg["websocket_server"]
+    hub = WebSocketHub(
+        loop=loop,
+        log_client_messages=bool(ws_cfg.get("log_client_messages", False)),
+    )
+    formatter = MessageFormatter(cfg)
+
+    pipeline_cd_cfg = cfg.get("pipeline_cooldown", {})
+    pipeline_cooldown = PipelineCooldownManager(
+        enabled=bool(pipeline_cd_cfg.get("enabled", True)),
+        cooldown_seconds=float(pipeline_cd_cfg.get("cooldown_seconds", 30.0)),
     )
 
-    if bool(ws_cfg.get("connect_on_start", True)):
-        try:
-            sender.connect()
-        except Exception as e:
-            logging.warning("Initial WebSocket connect failed: %s", e)
+    host = str(ws_cfg.get("host", "127.0.0.1"))
+    port = int(ws_cfg.get("port", 8080))
+
+    server = await websockets.serve(hub.handler, host, port)
+    logging.info("WebSocket server listening on ws://%s:%d", host, port)
 
     recursive = bool(cfg["watcher"].get("recursive", False))
     poll_interval = float(cfg["watcher"].get("poll_interval_seconds", 1.0))
@@ -547,9 +661,15 @@ def main() -> None:
     try:
         if stage1 is not None:
             stage1.folder.mkdir(parents=True, exist_ok=True)
-            dispatcher1 = DelayedQueueDispatcher(stage1.name, stage1.queue, sender.send_json)
+            dispatcher1 = DelayedQueueDispatcher(stage1.name, stage1.queue, hub.send_json_threadsafe)
             dispatchers[stage1.name] = dispatcher1
-            handler1 = WsForwardingHandler(stage1, dispatcher1)
+            handler1 = WsForwardingHandler(
+                stage1,
+                dispatcher1,
+                formatter=formatter,
+                pipeline_cooldown=None,
+                apply_pipeline_cooldown=False,
+            )
             observer1 = Observer(timeout=poll_interval)
             observer1.schedule(handler1, str(stage1.folder), recursive=recursive)
             observer1.start()
@@ -568,39 +688,43 @@ def main() -> None:
 
         if stage3 is not None:
             stage3.folder.mkdir(parents=True, exist_ok=True)
-            dispatcher3 = DelayedQueueDispatcher(stage3.name, stage3.queue, sender.send_json)
+            dispatcher3 = DelayedQueueDispatcher(stage3.name, stage3.queue, hub.send_json_threadsafe)
             dispatchers[stage3.name] = dispatcher3
-            handler3 = WsForwardingHandler(stage3, dispatcher3)
+            handler3 = WsForwardingHandler(
+                stage3,
+                dispatcher3,
+                formatter=formatter,
+                pipeline_cooldown=pipeline_cooldown,
+                apply_pipeline_cooldown=True,
+            )
             observer3 = Observer(timeout=poll_interval)
             observer3.schedule(handler3, str(stage3.folder), recursive=recursive)
             observer3.start()
             observers.append(observer3)
             logging.info("Watching [%s] folder: %s", stage3.name, str(stage3.folder.resolve()))
-            if stage3.queue.enabled:
-                logging.info(
-                    "[%s] Queue enabled, cooldown=%.2f sec, dedupe=%s",
-                    stage3.name,
-                    stage3.queue.cooldown_seconds,
-                    stage3.queue.deduplicate_by_full_path,
-                )
 
         if not observers:
             raise SystemExit("No stages enabled in config.")
 
-        while True:
-            time.sleep(1.0)
+        stop_event = asyncio.Event()
+        try:
+            await stop_event.wait()
+        finally:
+            for observer in observers:
+                observer.stop()
+            for observer in observers:
+                observer.join()
+            for dispatcher in dispatchers.values():
+                dispatcher.shutdown()
+            server.close()
+            await server.wait_closed()
 
-    except KeyboardInterrupt:
-        logging.info("Stopping watcher...")
-    finally:
-        for observer in observers:
-            observer.stop()
-        for observer in observers:
-            observer.join()
-        for dispatcher in dispatchers.values():
-            dispatcher.shutdown()
-        sender.close()
+    except asyncio.CancelledError:
+        raise
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        logging.info("Stopping watcher...")
