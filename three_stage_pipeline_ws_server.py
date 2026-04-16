@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+# #!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
@@ -38,8 +38,15 @@ DEFAULT_CONFIG = {
         "envelope_type": "pipeline_event"
     },
     "pipeline_cooldown": {
+        "enabled": False,
+        "cooldown_seconds": 0.0
+    },
+    "stage3_ack_gate": {
         "enabled": True,
-        "cooldown_seconds": 30.0
+        "ack_message_type": "stage2_ack",
+        "match_by": "pipeline_key",
+        "fallback_send_after_seconds": 0.0,
+        "log_ack_messages": True
     },
     "watcher": {
         "recursive": False,
@@ -52,7 +59,7 @@ DEFAULT_CONFIG = {
     "stage1_source_jpg_watch": {
         "enabled": True,
         "folder": r"C:\\Pipeline\\InputA",
-        "file_regex": r"^image\d+\.jpg$",
+        "file_regex": r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.jpg$",
         "case_sensitive": False,
         "event_type": "source_jpg_ready",
         "allowed_events": ["created", "moved"],
@@ -65,7 +72,7 @@ DEFAULT_CONFIG = {
     "stage2_processed_jpg_watch": {
         "enabled": True,
         "folder": r"C:\\Pipeline\\InputB",
-        "file_regex": r"^image\d+\.jpg$",
+        "file_regex": r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.jpg$",
         "case_sensitive": False,
         "allowed_events": ["created", "moved"],
         "run_pipeline": {
@@ -178,11 +185,20 @@ def wait_until_file_stable(path: Path, check_interval_seconds: float, stable_che
 
 
 def extract_pipeline_key(path: Path) -> str:
-    name = path.stem
-    m = re.search(r"(image\d+)", name, flags=re.IGNORECASE)
-    if m:
-        return m.group(1).lower()
-    return name.lower()
+    """
+    For the new naming scheme, use the timestamp stem directly as the pipeline key.
+    Example: 2026-04-16_08-28-56.jpg -> 2026-04-16_08-28-56
+    This keeps stage 1 / stage 2 / stage 3 / ACK matching stable as long as they
+    all refer to the same timestamp-based filename or emitted pipeline_key.
+    """
+    return path.stem.lower()
+
+
+def extract_ack_key_from_message(message_obj: dict, match_by: str) -> str | None:
+    value = message_obj.get(match_by)
+    if value is None:
+        return None
+    return str(value).strip().lower() or None
 
 
 @dataclass
@@ -231,11 +247,25 @@ class PipelineCooldownManager:
 
 
 class WebSocketHub:
-    def __init__(self, loop: asyncio.AbstractEventLoop, log_client_messages: bool = False):
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        log_client_messages: bool = False,
+        ack_message_type: str = "stage2_ack",
+        ack_match_by: str = "pipeline_key",
+        ack_log_messages: bool = True,
+    ):
         self.loop = loop
         self.log_client_messages = log_client_messages
+        self.ack_message_type = ack_message_type
+        self.ack_match_by = ack_match_by
+        self.ack_log_messages = ack_log_messages
         self.clients: set[WebSocketServerProtocol] = set()
         self.clients_lock = threading.Lock()
+        self.ack_gate = None
+
+    def set_ack_gate(self, ack_gate) -> None:
+        self.ack_gate = ack_gate
 
     async def register(self, ws: WebSocketServerProtocol) -> None:
         with self.clients_lock:
@@ -253,6 +283,19 @@ class WebSocketHub:
             async for message in websocket:
                 if self.log_client_messages:
                     logging.info("Client -> %s", message)
+
+                try:
+                    obj = json.loads(message)
+                except Exception:
+                    continue
+
+                msg_type = str(obj.get("type", "")).strip()
+                if msg_type == self.ack_message_type and self.ack_gate is not None:
+                    ack_key = extract_ack_key_from_message(obj, self.ack_match_by)
+                    if ack_key:
+                        if self.ack_log_messages:
+                            logging.info("ACK received type=%s %s=%s", msg_type, self.ack_match_by, ack_key)
+                        self.ack_gate.note_ack(ack_key, raw_message=obj)
         except Exception as e:
             logging.warning("WebSocket client handler ended: %s", e)
         finally:
@@ -286,7 +329,101 @@ class WebSocketHub:
         asyncio.run_coroutine_threadsafe(self._broadcast(payload), self.loop)
 
 
+class Stage3AckGate:
+    def __init__(
+        self,
+        enabled: bool,
+        match_by: str,
+        fallback_send_after_seconds: float,
+        send_func: Callable[[dict], None],
+    ):
+        self.enabled = enabled
+        self.match_by = match_by
+        self.fallback_send_after_seconds = fallback_send_after_seconds
+        self.send_func = send_func
+        self.lock = threading.Lock()
+        self.acked_keys: set[str] = set()
+        self.pending_payloads: dict[str, dict] = {}
+        self.pending_timers: dict[str, threading.Timer] = {}
+
+    def _extract_key(self, payload: dict) -> str | None:
+        value = payload.get(self.match_by)
+        if value is None:
+            return None
+        return str(value).strip().lower() or None
+
+    def _cancel_timer_locked(self, key: str) -> None:
+        timer = self.pending_timers.pop(key, None)
+        if timer is not None:
+            timer.cancel()
+
+    def _fallback_fire(self, key: str) -> None:
+        payload = None
+        with self.lock:
+            payload = self.pending_payloads.pop(key, None)
+            self.pending_timers.pop(key, None)
+        if payload is not None:
+            logging.info("[stage3_ack_gate] Fallback releasing pending payload for %s", key)
+            self.send_func(payload)
+
+    def note_ack(self, key: str, raw_message: dict | None = None) -> None:
+        payload = None
+        with self.lock:
+            existing = self.pending_payloads.pop(key, None)
+            self._cancel_timer_locked(key)
+            if existing is not None:
+                payload = existing
+            else:
+                self.acked_keys.add(key)
+
+        if payload is not None:
+            logging.info("[stage3_ack_gate] ACK matched pending payload for %s; sending now", key)
+            self.send_func(payload)
+        else:
+            logging.info("[stage3_ack_gate] ACK stored early for %s", key)
+
+    def enqueue_or_send(self, payload: dict) -> None:
+        if not self.enabled:
+            self.send_func(payload)
+            return
+
+        key = self._extract_key(payload)
+        if not key:
+            logging.warning("[stage3_ack_gate] Missing %s in payload; sending immediately", self.match_by)
+            self.send_func(payload)
+            return
+
+        send_now = False
+        with self.lock:
+            if key in self.acked_keys:
+                self.acked_keys.discard(key)
+                send_now = True
+            else:
+                self.pending_payloads[key] = payload
+                self._cancel_timer_locked(key)
+                if self.fallback_send_after_seconds > 0.0:
+                    timer = threading.Timer(self.fallback_send_after_seconds, self._fallback_fire, args=[key])
+                    timer.daemon = True
+                    timer.start()
+                    self.pending_timers[key] = timer
+                logging.info("[stage3_ack_gate] Holding stage3 payload until ACK for %s", key)
+
+        if send_now:
+            logging.info("[stage3_ack_gate] ACK already arrived for %s; sending now", key)
+            self.send_func(payload)
+
+    def shutdown(self) -> None:
+        with self.lock:
+            timers = list(self.pending_timers.values())
+            self.pending_timers.clear()
+            self.pending_payloads.clear()
+            self.acked_keys.clear()
+        for timer in timers:
+            timer.cancel()
+
+
 class MessageFormatter:
+
     def __init__(self, cfg: dict):
         self.wrap_in_payload = bool(cfg.get("message_format", {}).get("wrap_in_payload", True))
         self.envelope_type = str(cfg.get("message_format", {}).get("envelope_type", "pipeline_event"))
@@ -630,9 +767,13 @@ async def main_async() -> None:
 
     loop = asyncio.get_running_loop()
     ws_cfg = cfg["websocket_server"]
+    ack_gate_cfg = cfg.get("stage3_ack_gate", {})
     hub = WebSocketHub(
         loop=loop,
         log_client_messages=bool(ws_cfg.get("log_client_messages", False)),
+        ack_message_type=str(ack_gate_cfg.get("ack_message_type", "stage2_ack")),
+        ack_match_by=str(ack_gate_cfg.get("match_by", "pipeline_key")),
+        ack_log_messages=bool(ack_gate_cfg.get("log_ack_messages", True)),
     )
     formatter = MessageFormatter(cfg)
 
@@ -689,13 +830,20 @@ async def main_async() -> None:
         if stage3 is not None:
             stage3.folder.mkdir(parents=True, exist_ok=True)
             dispatcher3 = DelayedQueueDispatcher(stage3.name, stage3.queue, hub.send_json_threadsafe)
-            dispatchers[stage3.name] = dispatcher3
+            stage3_ack_gate = Stage3AckGate(
+                enabled=bool(ack_gate_cfg.get("enabled", True)),
+                match_by=str(ack_gate_cfg.get("match_by", "pipeline_key")),
+                fallback_send_after_seconds=float(ack_gate_cfg.get("fallback_send_after_seconds", 0.0)),
+                send_func=dispatcher3.enqueue_or_send,
+            )
+            hub.set_ack_gate(stage3_ack_gate)
+            dispatchers[stage3.name] = stage3_ack_gate
             handler3 = WsForwardingHandler(
                 stage3,
                 dispatcher3,
                 formatter=formatter,
                 pipeline_cooldown=pipeline_cooldown,
-                apply_pipeline_cooldown=True,
+                apply_pipeline_cooldown=bool(pipeline_cd_cfg.get("enabled", False)),
             )
             observer3 = Observer(timeout=poll_interval)
             observer3.schedule(handler3, str(stage3.folder), recursive=recursive)

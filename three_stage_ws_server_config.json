@@ -9,8 +9,8 @@
     "envelope_type": "pipeline_event"
   },
   "pipeline_cooldown": {
-    "enabled": true,
-    "cooldown_seconds": 30.0
+    "enabled": false,
+    "cooldown_seconds": 0.0
   },
   "watcher": {
     "recursive": false,
@@ -23,7 +23,7 @@
   "stage1_source_jpg_watch": {
     "enabled": true,
     "folder": "C:\\Users\\User\\WorkAssets\\DVCY02\\TestFolerOrignalImage",
-    "file_regex": "^image\\d+\\.jpg$",
+    "file_regex": "^\\d{4}-\\d{2}-\\d{2}_\\d{2}-\\d{2}-\\d{2}\\.jpg$",
     "case_sensitive": false,
     "event_type": "source_jpg_ready",
     "allowed_events": [
@@ -39,7 +39,7 @@
   "stage2_processed_jpg_watch": {
     "enabled": true,
     "folder": "C:\\Users\\User\\WorkAssets\\DVCY02\\TestFolderModifiedImage",
-    "file_regex": "^image\\d+\\.jpg$",
+    "file_regex": "^\\d{4}-\\d{2}-\\d{2}_\\d{2}-\\d{2}-\\d{2}\\.jpg$",
     "case_sensitive": false,
     "allowed_events": [
       "created",
@@ -69,5 +69,12 @@
       "cooldown_seconds": 0.0,
       "deduplicate_by_full_path": true
     }
+  },
+  "stage3_ack_gate": {
+    "enabled": true,
+    "ack_message_type": "stage2_ack",
+    "match_by": "pipeline_key",
+    "fallback_send_after_seconds": 0.0,
+    "log_ack_messages": true
   }
 }
