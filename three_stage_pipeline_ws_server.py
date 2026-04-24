@@ -1,4 +1,4 @@
-# #!/usr/bin/env python3
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
@@ -10,6 +10,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -46,7 +48,21 @@ DEFAULT_CONFIG = {
         "ack_message_type": "stage2_ack",
         "match_by": "pipeline_key",
         "fallback_send_after_seconds": 0.0,
-        "log_ack_messages": True
+        "consume_ack_after_send": True
+    },
+    "weather_monitor": {
+        "enabled": True,
+        "provider": "open_meteo",
+        "location_name": "Chiayi City",
+        "latitude": 23.4800751,
+        "longitude": 120.4491113,
+        "timezone": "Asia/Taipei",
+        "poll_interval_seconds": 300.0,
+        "send_on_start": True,
+        "send_only_on_change": True,
+        "rain_threshold_mm": 0.0,
+        "message_type": "weather",
+        "wrap_in_payload": True
     },
     "watcher": {
         "recursive": False,
@@ -59,7 +75,7 @@ DEFAULT_CONFIG = {
     "stage1_source_jpg_watch": {
         "enabled": True,
         "folder": r"C:\\Pipeline\\InputA",
-        "file_regex": r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.jpg$",
+        "file_regex": r"^image\d+\.jpg$",
         "case_sensitive": False,
         "event_type": "source_jpg_ready",
         "allowed_events": ["created", "moved"],
@@ -72,7 +88,7 @@ DEFAULT_CONFIG = {
     "stage2_processed_jpg_watch": {
         "enabled": True,
         "folder": r"C:\\Pipeline\\InputB",
-        "file_regex": r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.jpg$",
+        "file_regex": r"^image\d+\.jpg$",
         "case_sensitive": False,
         "allowed_events": ["created", "moved"],
         "run_pipeline": {
@@ -184,21 +200,27 @@ def wait_until_file_stable(path: Path, check_interval_seconds: float, stable_che
         time.sleep(check_interval_seconds)
 
 
+TIMESTAMP_KEY_RE = re.compile(r"(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})")
+
+
 def extract_pipeline_key(path: Path) -> str:
     """
-    For the new naming scheme, use the timestamp stem directly as the pipeline key.
-    Example: 2026-04-16_08-28-56.jpg -> 2026-04-16_08-28-56
-    This keeps stage 1 / stage 2 / stage 3 / ACK matching stable as long as they
-    all refer to the same timestamp-based filename or emitted pipeline_key.
+    Shared key extractor for the new timestamp naming scheme.
+
+    Examples:
+    - 2026-04-16_08-28-56.jpg -> 2026-04-16_08-28-56
+    - output_output_2026-04-16_08-28-56_vector_spawn_points.json -> 2026-04-16_08-28-56
     """
-    return path.stem.lower()
+    name = path.stem
+    timestamp = TIMESTAMP_KEY_RE.search(name)
+    if timestamp:
+        return timestamp.group(1)
 
+    old_image_key = re.search(r"(image\d+)", name, flags=re.IGNORECASE)
+    if old_image_key:
+        return old_image_key.group(1).lower()
 
-def extract_ack_key_from_message(message_obj: dict, match_by: str) -> str | None:
-    value = message_obj.get(match_by)
-    if value is None:
-        return None
-    return str(value).strip().lower() or None
+    return name.lower()
 
 
 @dataclass
@@ -251,21 +273,13 @@ class WebSocketHub:
         self,
         loop: asyncio.AbstractEventLoop,
         log_client_messages: bool = False,
-        ack_message_type: str = "stage2_ack",
-        ack_match_by: str = "pipeline_key",
-        ack_log_messages: bool = True,
+        client_message_callback: Callable[[dict], None] | None = None,
     ):
         self.loop = loop
         self.log_client_messages = log_client_messages
-        self.ack_message_type = ack_message_type
-        self.ack_match_by = ack_match_by
-        self.ack_log_messages = ack_log_messages
+        self.client_message_callback = client_message_callback
         self.clients: set[WebSocketServerProtocol] = set()
         self.clients_lock = threading.Lock()
-        self.ack_gate = None
-
-    def set_ack_gate(self, ack_gate) -> None:
-        self.ack_gate = ack_gate
 
     async def register(self, ws: WebSocketServerProtocol) -> None:
         with self.clients_lock:
@@ -283,19 +297,15 @@ class WebSocketHub:
             async for message in websocket:
                 if self.log_client_messages:
                     logging.info("Client -> %s", message)
-
-                try:
-                    obj = json.loads(message)
-                except Exception:
-                    continue
-
-                msg_type = str(obj.get("type", "")).strip()
-                if msg_type == self.ack_message_type and self.ack_gate is not None:
-                    ack_key = extract_ack_key_from_message(obj, self.ack_match_by)
-                    if ack_key:
-                        if self.ack_log_messages:
-                            logging.info("ACK received type=%s %s=%s", msg_type, self.ack_match_by, ack_key)
-                        self.ack_gate.note_ack(ack_key, raw_message=obj)
+                if self.client_message_callback is not None:
+                    try:
+                        decoded = json.loads(message)
+                        if isinstance(decoded, dict):
+                            self.client_message_callback(decoded)
+                    except json.JSONDecodeError:
+                        logging.warning("Ignoring non-JSON client message: %s", message)
+                    except Exception as e:
+                        logging.warning("Client message callback failed: %s", e)
         except Exception as e:
             logging.warning("WebSocket client handler ended: %s", e)
         finally:
@@ -329,101 +339,7 @@ class WebSocketHub:
         asyncio.run_coroutine_threadsafe(self._broadcast(payload), self.loop)
 
 
-class Stage3AckGate:
-    def __init__(
-        self,
-        enabled: bool,
-        match_by: str,
-        fallback_send_after_seconds: float,
-        send_func: Callable[[dict], None],
-    ):
-        self.enabled = enabled
-        self.match_by = match_by
-        self.fallback_send_after_seconds = fallback_send_after_seconds
-        self.send_func = send_func
-        self.lock = threading.Lock()
-        self.acked_keys: set[str] = set()
-        self.pending_payloads: dict[str, dict] = {}
-        self.pending_timers: dict[str, threading.Timer] = {}
-
-    def _extract_key(self, payload: dict) -> str | None:
-        value = payload.get(self.match_by)
-        if value is None:
-            return None
-        return str(value).strip().lower() or None
-
-    def _cancel_timer_locked(self, key: str) -> None:
-        timer = self.pending_timers.pop(key, None)
-        if timer is not None:
-            timer.cancel()
-
-    def _fallback_fire(self, key: str) -> None:
-        payload = None
-        with self.lock:
-            payload = self.pending_payloads.pop(key, None)
-            self.pending_timers.pop(key, None)
-        if payload is not None:
-            logging.info("[stage3_ack_gate] Fallback releasing pending payload for %s", key)
-            self.send_func(payload)
-
-    def note_ack(self, key: str, raw_message: dict | None = None) -> None:
-        payload = None
-        with self.lock:
-            existing = self.pending_payloads.pop(key, None)
-            self._cancel_timer_locked(key)
-            if existing is not None:
-                payload = existing
-            else:
-                self.acked_keys.add(key)
-
-        if payload is not None:
-            logging.info("[stage3_ack_gate] ACK matched pending payload for %s; sending now", key)
-            self.send_func(payload)
-        else:
-            logging.info("[stage3_ack_gate] ACK stored early for %s", key)
-
-    def enqueue_or_send(self, payload: dict) -> None:
-        if not self.enabled:
-            self.send_func(payload)
-            return
-
-        key = self._extract_key(payload)
-        if not key:
-            logging.warning("[stage3_ack_gate] Missing %s in payload; sending immediately", self.match_by)
-            self.send_func(payload)
-            return
-
-        send_now = False
-        with self.lock:
-            if key in self.acked_keys:
-                self.acked_keys.discard(key)
-                send_now = True
-            else:
-                self.pending_payloads[key] = payload
-                self._cancel_timer_locked(key)
-                if self.fallback_send_after_seconds > 0.0:
-                    timer = threading.Timer(self.fallback_send_after_seconds, self._fallback_fire, args=[key])
-                    timer.daemon = True
-                    timer.start()
-                    self.pending_timers[key] = timer
-                logging.info("[stage3_ack_gate] Holding stage3 payload until ACK for %s", key)
-
-        if send_now:
-            logging.info("[stage3_ack_gate] ACK already arrived for %s; sending now", key)
-            self.send_func(payload)
-
-    def shutdown(self) -> None:
-        with self.lock:
-            timers = list(self.pending_timers.values())
-            self.pending_timers.clear()
-            self.pending_payloads.clear()
-            self.acked_keys.clear()
-        for timer in timers:
-            timer.cancel()
-
-
 class MessageFormatter:
-
     def __init__(self, cfg: dict):
         self.wrap_in_payload = bool(cfg.get("message_format", {}).get("wrap_in_payload", True))
         self.envelope_type = str(cfg.get("message_format", {}).get("envelope_type", "pipeline_event"))
@@ -510,6 +426,213 @@ class DelayedQueueDispatcher:
                 self.timer = None
 
 
+
+class Stage3AckGate:
+    def __init__(self, cfg: dict, send_func: Callable[[dict], None]):
+        self.enabled = bool(cfg.get("enabled", False))
+        self.ack_message_type = str(cfg.get("ack_message_type", "stage2_ack"))
+        self.match_by = str(cfg.get("match_by", "pipeline_key"))
+        self.fallback_send_after_seconds = float(cfg.get("fallback_send_after_seconds", 0.0))
+        self.consume_ack_after_send = bool(cfg.get("consume_ack_after_send", True))
+        self.send_func = send_func
+        self.lock = threading.Lock()
+        self.ack_seen_by_key: set[str] = set()
+        self.pending_by_key: dict[str, dict] = {}
+        self.fallback_timers_by_key: dict[str, threading.Timer] = {}
+
+    def _key_from_client_message(self, message: dict) -> str | None:
+        if message.get("type") != self.ack_message_type:
+            return None
+        value = message.get(self.match_by)
+        if value is None and isinstance(message.get("payload"), dict):
+            value = message["payload"].get(self.match_by)
+        if value is None:
+            return None
+        return str(value)
+
+    def on_client_message(self, message: dict) -> None:
+        if not self.enabled:
+            return
+        key = self._key_from_client_message(message)
+        if not key:
+            return
+
+        payload_to_send = None
+        with self.lock:
+            logging.info("[ACKGATE] ACK received key=%s", key)
+            self.ack_seen_by_key.add(key)
+            payload_to_send = self.pending_by_key.pop(key, None)
+            timer = self.fallback_timers_by_key.pop(key, None)
+            if timer is not None:
+                timer.cancel()
+            if payload_to_send is not None and self.consume_ack_after_send:
+                self.ack_seen_by_key.discard(key)
+
+        if payload_to_send is not None:
+            logging.info("[ACKGATE] RELEASE stage3 key=%s after ACK", key)
+            self.send_func(payload_to_send)
+
+    def handle_stage3_payload(self, key: str, payload: dict) -> None:
+        if not self.enabled:
+            self.send_func(payload)
+            return
+
+        should_send_now = False
+        with self.lock:
+            logging.info("[ACKGATE] Stage3 JSON ready key=%s", key)
+            if key in self.ack_seen_by_key:
+                should_send_now = True
+                if self.consume_ack_after_send:
+                    self.ack_seen_by_key.discard(key)
+            else:
+                self.pending_by_key[key] = payload
+                logging.info("[ACKGATE] HOLD stage3 key=%s waiting for ACK", key)
+                if self.fallback_send_after_seconds > 0.0 and key not in self.fallback_timers_by_key:
+                    timer = threading.Timer(self.fallback_send_after_seconds, self._fallback_release, args=(key,))
+                    timer.daemon = True
+                    self.fallback_timers_by_key[key] = timer
+                    timer.start()
+
+        if should_send_now:
+            logging.info("[ACKGATE] RELEASE stage3 key=%s immediately; ACK was already received", key)
+            self.send_func(payload)
+
+    def _fallback_release(self, key: str) -> None:
+        payload_to_send = None
+        with self.lock:
+            payload_to_send = self.pending_by_key.pop(key, None)
+            self.fallback_timers_by_key.pop(key, None)
+        if payload_to_send is not None:
+            logging.warning("[ACKGATE] Fallback release stage3 key=%s", key)
+            self.send_func(payload_to_send)
+
+    def shutdown(self) -> None:
+        with self.lock:
+            for timer in self.fallback_timers_by_key.values():
+                timer.cancel()
+            self.fallback_timers_by_key.clear()
+
+
+class WeatherMonitor:
+    RAIN_WEATHER_CODES = {
+        51, 53, 55, 56, 57,
+        61, 63, 65, 66, 67,
+        80, 81, 82,
+        95, 96, 99,
+    }
+
+    def __init__(self, cfg: dict, send_func: Callable[[dict], None]):
+        self.enabled = bool(cfg.get("enabled", False))
+        self.provider = str(cfg.get("provider", "open_meteo"))
+        self.location_name = str(cfg.get("location_name", "Chiayi City"))
+        self.latitude = float(cfg.get("latitude", 23.4800751))
+        self.longitude = float(cfg.get("longitude", 120.4491113))
+        self.timezone = str(cfg.get("timezone", "Asia/Taipei"))
+        self.poll_interval_seconds = float(cfg.get("poll_interval_seconds", 300.0))
+        self.send_on_start = bool(cfg.get("send_on_start", True))
+        self.send_only_on_change = bool(cfg.get("send_only_on_change", True))
+        self.rain_threshold_mm = float(cfg.get("rain_threshold_mm", 0.0))
+        self.message_type = str(cfg.get("message_type", "weather"))
+        self.wrap_in_payload = bool(cfg.get("wrap_in_payload", True))
+        self.send_func = send_func
+        self._last_raining: bool | None = None
+
+    def _build_url(self) -> str:
+        query = urllib.parse.urlencode({
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "current": "temperature_2m,precipitation,rain,showers,weather_code,is_day",
+            "timezone": self.timezone,
+        })
+        return f"https://api.open-meteo.com/v1/forecast?{query}"
+
+    def _fetch_current_weather(self) -> dict:
+        req = urllib.request.Request(
+            self._build_url(),
+            headers={"User-Agent": "three-stage-ws-weather-monitor/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _make_weather_message(self, api_data: dict) -> tuple[bool, dict]:
+        current = api_data.get("current", {}) or {}
+        units = api_data.get("current_units", {}) or {}
+
+        precipitation = float(current.get("precipitation") or 0.0)
+        rain = float(current.get("rain") or 0.0)
+        showers = float(current.get("showers") or 0.0)
+        weather_code = int(current.get("weather_code") or 0)
+        raining = (
+            rain > self.rain_threshold_mm
+            or precipitation > self.rain_threshold_mm
+            or showers > self.rain_threshold_mm
+            or weather_code in self.RAIN_WEATHER_CODES
+        )
+
+        payload = {
+            "location": self.location_name,
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "raining": raining,
+            "precipitation": precipitation,
+            "rain": rain,
+            "showers": showers,
+            "weather_code": weather_code,
+            "temperature_2m": current.get("temperature_2m"),
+            "is_day": current.get("is_day"),
+            "weather_time": current.get("time"),
+            "timestamp": time.time(),
+            "units": {
+                "precipitation": units.get("precipitation", "mm"),
+                "rain": units.get("rain", "mm"),
+                "showers": units.get("showers", "mm"),
+                "temperature_2m": units.get("temperature_2m", "°C"),
+            },
+            "source": "open-meteo",
+        }
+        if self.wrap_in_payload:
+            message = {"type": self.message_type, "payload": payload}
+        else:
+            message = {"type": self.message_type, **payload}
+        return raining, message
+
+    async def run(self) -> None:
+        if not self.enabled:
+            return
+        if self.provider != "open_meteo":
+            logging.warning("Weather monitor provider unsupported: %s", self.provider)
+            return
+
+        logging.info(
+            "Weather monitor enabled for %s at %.7f, %.7f; polling every %.1fs",
+            self.location_name,
+            self.latitude,
+            self.longitude,
+            self.poll_interval_seconds,
+        )
+
+        first = True
+        while True:
+            try:
+                api_data = await asyncio.to_thread(self._fetch_current_weather)
+                raining, message = self._make_weather_message(api_data)
+                should_send = (
+                    (first and self.send_on_start)
+                    or (not self.send_only_on_change)
+                    or (self._last_raining != raining)
+                )
+                if should_send:
+                    logging.info("Weather broadcast: raining=%s location=%s", raining, self.location_name)
+                    self.send_func(message)
+                self._last_raining = raining
+                first = False
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logging.warning("Weather monitor check failed: %s", e)
+            await asyncio.sleep(max(10.0, self.poll_interval_seconds))
+
+
 class PipelineRunner:
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -582,6 +705,8 @@ class WsForwardingHandler(FileSystemEventHandler):
         formatter: MessageFormatter,
         pipeline_cooldown: PipelineCooldownManager | None = None,
         apply_pipeline_cooldown: bool = False,
+        stage3_ack_gate: Stage3AckGate | None = None,
+        apply_stage3_ack_gate: bool = False,
     ):
         super().__init__()
         self.target = target
@@ -589,6 +714,8 @@ class WsForwardingHandler(FileSystemEventHandler):
         self.formatter = formatter
         self.pipeline_cooldown = pipeline_cooldown
         self.apply_pipeline_cooldown = apply_pipeline_cooldown
+        self.stage3_ack_gate = stage3_ack_gate
+        self.apply_stage3_ack_gate = apply_stage3_ack_gate
         self.last_seen_time_by_path = {}
         self.lock = threading.Lock()
 
@@ -643,7 +770,11 @@ class WsForwardingHandler(FileSystemEventHandler):
             "queue_name": self.target.name,
             "pipeline_key": pipeline_key,
         }
-        self.dispatcher.enqueue_or_send(self.formatter.format(payload))
+        formatted_payload = self.formatter.format(payload)
+        if self.apply_stage3_ack_gate and self.stage3_ack_gate is not None:
+            self.stage3_ack_gate.handle_stage3_payload(pipeline_key, formatted_payload)
+        else:
+            self.dispatcher.enqueue_or_send(formatted_payload)
 
     def on_created(self, event: FileSystemEvent) -> None:
         if not event.is_directory:
@@ -767,15 +898,28 @@ async def main_async() -> None:
 
     loop = asyncio.get_running_loop()
     ws_cfg = cfg["websocket_server"]
-    ack_gate_cfg = cfg.get("stage3_ack_gate", {})
+
+    stage3_ack_gate_holder: dict[str, Stage3AckGate | None] = {"gate": None}
+
+    def on_client_message(message: dict) -> None:
+        gate = stage3_ack_gate_holder.get("gate")
+        if gate is not None:
+            gate.on_client_message(message)
+
     hub = WebSocketHub(
         loop=loop,
         log_client_messages=bool(ws_cfg.get("log_client_messages", False)),
-        ack_message_type=str(ack_gate_cfg.get("ack_message_type", "stage2_ack")),
-        ack_match_by=str(ack_gate_cfg.get("match_by", "pipeline_key")),
-        ack_log_messages=bool(ack_gate_cfg.get("log_ack_messages", True)),
+        client_message_callback=on_client_message,
     )
     formatter = MessageFormatter(cfg)
+
+    stage3_ack_gate = Stage3AckGate(cfg.get("stage3_ack_gate", {}), hub.send_json_threadsafe)
+    stage3_ack_gate_holder["gate"] = stage3_ack_gate
+
+    weather_monitor = WeatherMonitor(cfg.get("weather_monitor", {}), hub.send_json_threadsafe)
+    weather_task: asyncio.Task | None = None
+    if weather_monitor.enabled:
+        weather_task = asyncio.create_task(weather_monitor.run())
 
     pipeline_cd_cfg = cfg.get("pipeline_cooldown", {})
     pipeline_cooldown = PipelineCooldownManager(
@@ -830,20 +974,15 @@ async def main_async() -> None:
         if stage3 is not None:
             stage3.folder.mkdir(parents=True, exist_ok=True)
             dispatcher3 = DelayedQueueDispatcher(stage3.name, stage3.queue, hub.send_json_threadsafe)
-            stage3_ack_gate = Stage3AckGate(
-                enabled=bool(ack_gate_cfg.get("enabled", True)),
-                match_by=str(ack_gate_cfg.get("match_by", "pipeline_key")),
-                fallback_send_after_seconds=float(ack_gate_cfg.get("fallback_send_after_seconds", 0.0)),
-                send_func=dispatcher3.enqueue_or_send,
-            )
-            hub.set_ack_gate(stage3_ack_gate)
-            dispatchers[stage3.name] = stage3_ack_gate
+            dispatchers[stage3.name] = dispatcher3
             handler3 = WsForwardingHandler(
                 stage3,
                 dispatcher3,
                 formatter=formatter,
                 pipeline_cooldown=pipeline_cooldown,
-                apply_pipeline_cooldown=bool(pipeline_cd_cfg.get("enabled", False)),
+                apply_pipeline_cooldown=True,
+                stage3_ack_gate=stage3_ack_gate,
+                apply_stage3_ack_gate=stage3_ack_gate.enabled,
             )
             observer3 = Observer(timeout=poll_interval)
             observer3.schedule(handler3, str(stage3.folder), recursive=recursive)
@@ -864,6 +1003,13 @@ async def main_async() -> None:
                 observer.join()
             for dispatcher in dispatchers.values():
                 dispatcher.shutdown()
+            stage3_ack_gate.shutdown()
+            if weather_task is not None:
+                weather_task.cancel()
+                try:
+                    await weather_task
+                except asyncio.CancelledError:
+                    pass
             server.close()
             await server.wait_closed()
 

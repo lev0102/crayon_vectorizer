@@ -57,7 +57,7 @@
   "stage3_spawn_json_watch": {
     "enabled": true,
     "folder": "C:\\Users\\User\\Documents\\program\\crayon_vectorizer\\output",
-    "file_regex": "^output_output_.*_vector_spawn_points\\.json$",
+    "file_regex": "^output_output_\\d{4}-\\d{2}-\\d{2}_\\d{2}-\\d{2}-\\d{2}_vector_spawn_points\\.json$",
     "case_sensitive": false,
     "event_type": "spawn_json_ready",
     "allowed_events": [
@@ -75,6 +75,20 @@
     "ack_message_type": "stage2_ack",
     "match_by": "pipeline_key",
     "fallback_send_after_seconds": 0.0,
-    "log_ack_messages": true
+    "consume_ack_after_send": true
+  },
+  "weather_monitor": {
+    "enabled": true,
+    "provider": "open_meteo",
+    "location_name": "Chiayi City",
+    "latitude": 23.4800751,
+    "longitude": 120.4491113,
+    "timezone": "Asia/Taipei",
+    "poll_interval_seconds": 300.0,
+    "send_on_start": true,
+    "send_only_on_change": true,
+    "rain_threshold_mm": 0.0,
+    "message_type": "weather",
+    "wrap_in_payload": true
   }
 }
